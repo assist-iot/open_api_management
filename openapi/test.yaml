@@ -1,0 +1,2291 @@
+---
+# Source: openapi/templates/service-account.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openapi-openapi
+  namespace: default
+  labels:
+    app.kubernetes.io/name: openapi
+    helm.sh/chart: openapi-0.1.0
+    app.kubernetes.io/instance: "openapi"
+    app.kubernetes.io/managed-by: "Helm"
+    app.kubernetes.io/version: "2.8"
+---
+# Source: openapi/charts/postgresql/templates/secrets.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: openapi-postgresql
+  namespace: default
+  labels:
+    app.kubernetes.io/name: postgresql
+    helm.sh/chart: postgresql-11.1.15
+    app.kubernetes.io/instance: openapi
+    app.kubernetes.io/managed-by: Helm
+type: Opaque
+data:
+  postgres-password: "eHZUaHlGSWpRRg=="
+  password: "a29uZw=="
+  # We don't auto-generate LDAP password when it's not provided as we do for other passwords
+---
+# Source: openapi/templates/secret-sa-token.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: openapi-openapi-token 
+  namespace: default
+  annotations:
+    kubernetes.io/service-account.name: openapi-openapi
+type: kubernetes.io/service-account-token
+---
+# Source: openapi/templates/configmaps/frontendconfig.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontendconfig
+  namespace: "default"
+data:
+    keycloak.json: |-
+      {
+        "realm": "OpenAPIkaranikas",
+        "auth-server-url": "http://192.168.49.2:8180/",
+        "ssl-required": "external",
+        "resource": "public-client",
+        "public-client": true,
+        "confidential-port": 0
+      }
+---
+# Source: openapi/templates/configmaps/kongoidcpluginconfig.yaml
+apiVersion: v1
+data:
+  filter.lua: |
+    local M = {}
+
+    local function shouldIgnoreRequest(patterns)
+      if (patterns) then
+        for _, pattern in ipairs(patterns) do
+          local isMatching = not (string.find(ngx.var.uri, pattern) == nil)
+          if (isMatching) then return true end
+        end
+      end
+      return false
+    end
+
+    function M.shouldProcessRequest(config)
+      return not shouldIgnoreRequest(config.filters)
+    end
+
+    return M
+  handler.lua: |
+    local BasePlugin = require "kong.plugins.base_plugin"
+    local OidcHandler = BasePlugin:extend()
+    local utils = require("kong.plugins.oidc.utils")
+    local filter = require("kong.plugins.oidc.filter")
+    local session = require("kong.plugins.oidc.session")
+
+    OidcHandler.PRIORITY = 1000
+
+
+    function OidcHandler:new()
+      OidcHandler.super.new(self, "oidc")
+    end
+
+    function OidcHandler:access(config)
+      OidcHandler.super.access(self)
+      local oidcConfig = utils.get_options(config, ngx)
+
+      if filter.shouldProcessRequest(oidcConfig) then
+        session.configure(config)
+        handle(oidcConfig)
+      else
+        ngx.log(ngx.DEBUG, "OidcHandler ignoring request, path: " .. ngx.var.request_uri)
+      end
+
+      ngx.log(ngx.DEBUG, "OidcHandler done")
+    end
+
+    function handle(oidcConfig)
+      local response
+      if oidcConfig.introspection_endpoint then
+        response = introspect(oidcConfig)
+        if response then
+          utils.injectUser(response)
+        end
+      end
+
+      if response == nil then
+        response = make_oidc(oidcConfig)
+        if response then
+          if (response.user) then
+            utils.injectUser(response.user)
+          end
+          if (response.access_token) then
+            utils.injectAccessToken(response.access_token)
+          end
+          if (response.id_token) then
+            utils.injectIDToken(response.id_token)
+          end
+        end
+      end
+    end
+
+    function make_oidc(oidcConfig)
+      ngx.log(ngx.DEBUG, "OidcHandler calling authenticate, requested path: " .. ngx.var.request_uri)
+      local res, err = require("resty.openidc").authenticate(oidcConfig)
+      if err then
+        if oidcConfig.recovery_page_path then
+          ngx.log(ngx.DEBUG, "Entering recovery page: " .. oidcConfig.recovery_page_path)
+          ngx.redirect(oidcConfig.recovery_page_path)
+        end
+        utils.exit(500, err, ngx.HTTP_INTERNAL_SERVER_ERROR)
+      end
+      return res
+    end
+
+    function introspect(oidcConfig)
+      if utils.has_bearer_access_token() or oidcConfig.bearer_only == "yes" then
+        local res, err = require("resty.openidc").introspect(oidcConfig)
+        if err then
+          if oidcConfig.bearer_only == "yes" then
+            ngx.header["WWW-Authenticate"] = 'Bearer realm="' .. oidcConfig.realm .. '",error="' .. err .. '"'
+            utils.exit(ngx.HTTP_UNAUTHORIZED, err, ngx.HTTP_UNAUTHORIZED)
+          end
+          return nil
+        end
+        ngx.log(ngx.DEBUG, "OidcHandler introspect succeeded, requested path: " .. ngx.var.request_uri)
+        return res
+      end
+      return nil
+    end
+
+
+    return OidcHandler
+  schema.lua: |
+    return {
+      no_consumer = true,
+      fields = {
+        client_id = { type = "string", required = true },
+        client_secret = { type = "string", required = true },
+        discovery = { type = "string", required = true, default = "https://.well-known/openid-configuration" },
+        introspection_endpoint = { type = "string", required = false },
+        timeout = { type = "number", required = false },
+        introspection_endpoint_auth_method = { type = "string", required = false },
+        bearer_only = { type = "string", required = true, default = "no" },
+        realm = { type = "string", required = true, default = "kong" },
+        redirect_uri_path = { type = "string" },
+        scope = { type = "string", required = true, default = "openid" },
+        response_type = { type = "string", required = true, default = "code" },
+        ssl_verify = { type = "string", required = true, default = "no" },
+        token_endpoint_auth_method = { type = "string", required = true, default = "client_secret_post" },
+        session_secret = { type = "string", required = false },
+        recovery_page_path = { type = "string" },
+        logout_path = { type = "string", required = false, default = '/logout' },
+        redirect_after_logout_uri = { type = "string", required = false, default = '/' },
+        filters = { type = "string" }
+      }
+    }
+  session.lua: |
+    local utils = require("kong.plugins.oidc.utils")
+
+    local M = {}
+
+    function M.configure(config)
+      if config.session_secret then
+        local decoded_session_secret = ngx.decode_base64(config.session_secret)
+        if not decoded_session_secret then
+          utils.exit(500, "invalid OIDC plugin configuration, session secret could not be decoded", ngx.exit(ngx.HTTP_INTERNAL_SERVER_ERROR))
+        end
+        ngx.var.session_secret = decoded_session_secret
+      end
+    end
+
+    return M
+  utils.lua: |
+    local cjson = require("cjson")
+
+    local M = {}
+
+    local function parseFilters(csvFilters)
+      local filters = {}
+      if (not (csvFilters == nil)) then
+        for pattern in string.gmatch(csvFilters, "[^,]+") do
+          table.insert(filters, pattern)
+        end
+      end
+      return filters
+    end
+
+    function M.get_redirect_uri_path(ngx)
+      local function drop_query()
+        local uri = ngx.var.request_uri
+        local x = uri:find("?")
+        if x then
+          return uri:sub(1, x - 1)
+        else
+          return uri
+        end
+      end
+
+      local function tackle_slash(path)
+        local args = ngx.req.get_uri_args()
+        if args and args.code then
+          return path
+        elseif path == "/" then
+          return "/cb"
+        elseif path:sub(-1) == "/" then
+          return path:sub(1, -2)
+        else
+          return path .. "/"
+        end
+      end
+
+      return tackle_slash(drop_query())
+    end
+
+    function M.get_options(config, ngx)
+      return {
+        client_id = config.client_id,
+        client_secret = config.client_secret,
+        discovery = config.discovery,
+        introspection_endpoint = config.introspection_endpoint,
+        timeout = config.timeout,
+        introspection_endpoint_auth_method = config.introspection_endpoint_auth_method,
+        bearer_only = config.bearer_only,
+        realm = config.realm,
+        redirect_uri_path = config.redirect_uri_path or M.get_redirect_uri_path(ngx),
+        scope = config.scope,
+        response_type = config.response_type,
+        ssl_verify = config.ssl_verify,
+        token_endpoint_auth_method = config.token_endpoint_auth_method,
+        recovery_page_path = config.recovery_page_path,
+        filters = parseFilters(config.filters),
+        logout_path = config.logout_path,
+        redirect_after_logout_uri = config.redirect_after_logout_uri,
+      }
+    end
+
+    function M.exit(httpStatusCode, message, ngxCode)
+      ngx.status = httpStatusCode
+      ngx.say(message)
+      ngx.exit(ngxCode)
+    end
+
+    function M.injectAccessToken(accessToken)
+      ngx.req.set_header("X-Access-Token", accessToken)
+    end
+
+    function M.injectIDToken(idToken)
+      local tokenStr = cjson.encode(idToken)
+      ngx.req.set_header("X-ID-Token", ngx.encode_base64(tokenStr))
+    end
+
+    function M.injectUser(user)
+      local tmp_user = user
+      tmp_user.id = user.sub
+      tmp_user.username = user.preferred_username
+      ngx.ctx.authenticated_credential = tmp_user
+      local userinfo = cjson.encode(user)
+      ngx.req.set_header("X-Userinfo", ngx.encode_base64(userinfo))
+    end
+
+    function M.has_bearer_access_token()
+      local header = ngx.req.get_headers()['Authorization']
+      if header and header:find(" ") then
+        local divider = header:find(' ')
+        if string.lower(header:sub(0, divider-1)) == string.lower("Bearer") then
+          return true
+        end
+      end
+      return false
+    end
+
+    return M
+kind: ConfigMap
+metadata:
+  name: kong-oidc-plugin
+  namespace: "default"
+---
+# Source: openapi/templates/wait-for-postgres-script.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openapi-openapi-bash-wait-for-postgres
+  namespace: default
+  labels:
+    app.kubernetes.io/name: openapi
+    helm.sh/chart: openapi-0.1.0
+    app.kubernetes.io/instance: "openapi"
+    app.kubernetes.io/managed-by: "Helm"
+    app.kubernetes.io/version: "2.8"
+data:
+  wait.sh: |
+    until timeout 2 bash -c "9<>/dev/tcp/${KONG_PG_HOST}/${KONG_PG_PORT}"
+      do echo "waiting for db - trying ${KONG_PG_HOST}:${KONG_PG_PORT}"
+      sleep 2
+    done
+---
+# Source: openapi/templates/controller-rbac-resources.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: openapi
+    helm.sh/chart: openapi-0.1.0
+    app.kubernetes.io/instance: "openapi"
+    app.kubernetes.io/managed-by: "Helm"
+    app.kubernetes.io/version: "2.8"
+  name: openapi-openapi
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - endpoints
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - endpoints/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - secrets/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - services/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - configuration.konghq.com
+  resources:
+  - kongconsumers
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - configuration.konghq.com
+  resources:
+  - kongconsumers/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - configuration.konghq.com
+  resources:
+  - kongingresses
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - configuration.konghq.com
+  resources:
+  - kongingresses/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - configuration.konghq.com
+  resources:
+  - kongplugins
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - configuration.konghq.com
+  resources:
+  - kongplugins/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - configuration.konghq.com
+  resources:
+  - tcpingresses
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - configuration.konghq.com
+  resources:
+  - tcpingresses/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - configuration.konghq.com
+  resources:
+  - udpingresses
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - configuration.konghq.com
+  resources:
+  - udpingresses/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - extensions
+  resources:
+  - ingresses
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - extensions
+  resources:
+  - ingresses/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - ingresses
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - ingresses/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - endpoints
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - configuration.konghq.com
+  resources:
+  - kongclusterplugins
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - configuration.konghq.com
+  resources:
+  - kongclusterplugins/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - ingressclasses
+  verbs:
+  - get
+  - list
+  - watch
+---
+# Source: openapi/templates/controller-rbac-resources.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: openapi-openapi
+  labels:
+    app.kubernetes.io/name: openapi
+    helm.sh/chart: openapi-0.1.0
+    app.kubernetes.io/instance: "openapi"
+    app.kubernetes.io/managed-by: "Helm"
+    app.kubernetes.io/version: "2.8"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: openapi-openapi
+subjects:
+  - kind: ServiceAccount
+    name: openapi-openapi
+    namespace: default
+---
+# Source: openapi/templates/controller-rbac-resources.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: openapi-openapi
+  namespace: default
+  labels:
+    app.kubernetes.io/name: openapi
+    helm.sh/chart: openapi-0.1.0
+    app.kubernetes.io/instance: "openapi"
+    app.kubernetes.io/managed-by: "Helm"
+    app.kubernetes.io/version: "2.8"
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+      - pods
+      - secrets
+      - namespaces
+    verbs:
+      - get
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    resourceNames:
+      # Defaults to "<election-id>-<ingress-class>"
+      # Here: "<kong-ingress-controller-leader-nginx>-<nginx>"
+      # This has to be adapted if you change either parameter
+      # when launching the nginx-ingress-controller.
+      - "kong-ingress-controller-leader-kong-kong"
+    verbs:
+      - get
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - create
+  - apiGroups:
+      - ""
+    resources:
+      - endpoints
+    verbs:
+      - get
+  # Begin KIC 2.x leader permissions
+  - apiGroups:
+      - ""
+      - coordination.k8s.io
+    resources:
+      - configmaps
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+  - apiGroups:
+      - ""
+    resources:
+      - services
+      - endpoints
+    verbs:
+      - get
+---
+# Source: openapi/templates/controller-rbac-resources.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: openapi-openapi
+  namespace: default
+  labels:
+    app.kubernetes.io/name: openapi
+    helm.sh/chart: openapi-0.1.0
+    app.kubernetes.io/instance: "openapi"
+    app.kubernetes.io/managed-by: "Helm"
+    app.kubernetes.io/version: "2.8"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: openapi-openapi
+subjects:
+  - kind: ServiceAccount
+    name: openapi-openapi
+    namespace: default
+---
+# Source: openapi/charts/postgresql/templates/primary/svc-headless.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: openapi-postgresql-hl
+  namespace: default
+  labels:
+    app.kubernetes.io/name: postgresql
+    helm.sh/chart: postgresql-11.1.15
+    app.kubernetes.io/instance: openapi
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: primary
+    # Use this annotation in addition to the actual publishNotReadyAddresses
+    # field below because the annotation will stop being respected soon but the
+    # field is broken in some versions of Kubernetes:
+    # https://github.com/kubernetes/kubernetes/issues/58662
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+spec:
+  type: ClusterIP
+  clusterIP: None
+  # We want all pods in the StatefulSet to have their addresses published for
+  # the sake of the other Postgresql pods even before they're ready, since they
+  # have to be able to talk to each other in order to become ready.
+  publishNotReadyAddresses: true
+  ports:
+    - name: tcp-postgresql
+      port: 5432
+      targetPort: tcp-postgresql
+  selector:
+    app.kubernetes.io/name: postgresql
+    app.kubernetes.io/instance: openapi
+    app.kubernetes.io/component: primary
+---
+# Source: openapi/charts/postgresql/templates/primary/svc.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: openapi-postgresql
+  namespace: default
+  labels:
+    app.kubernetes.io/name: postgresql
+    helm.sh/chart: postgresql-11.1.15
+    app.kubernetes.io/instance: openapi
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: primary
+  annotations:
+spec:
+  type: ClusterIP
+  ports:
+    - name: tcp-postgresql
+      port: 5432
+      targetPort: tcp-postgresql
+      nodePort: null
+  selector:
+    app.kubernetes.io/name: postgresql
+    app.kubernetes.io/instance: openapi
+    app.kubernetes.io/component: primary
+---
+# Source: openapi/templates/backend/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: openapi-backend
+  namespace: "default"
+  labels:
+    helm.sh/chart: openapi-0.1.0
+    app.kubernetes.io/name: openapi
+    app.kubernetes.io/instance: openapi
+    enabler: openapi
+    app.kubernetes.io/component: backend
+    isMainInterface: "no"
+    tier: internal
+    app.kubernetes.io/version: "2.8"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  type: NodePort
+  ports:
+    - port: 8999
+      targetPort: 80
+      protocol: TCP
+      nodePort: 30900
+      
+  selector:
+    app.kubernetes.io/name: openapi
+    app.kubernetes.io/instance: openapi
+    enabler: openapi
+    app.kubernetes.io/component: backend
+    isMainInterface: "no"
+    tier: internal
+---
+# Source: openapi/templates/frontend/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: openapi-frontend
+  namespace: "default"
+  labels:
+    helm.sh/chart: openapi-0.1.0
+    app.kubernetes.io/name: openapi
+    app.kubernetes.io/instance: openapi
+    enabler: openapi
+    app.kubernetes.io/component: frontend
+    isMainInterface: "no"
+    tier: internal
+    app.kubernetes.io/version: "2.8"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  type: NodePort
+  ports:
+    - port: 3000
+      targetPort: 3000
+      protocol: TCP
+      nodePort: 30300
+      
+  selector:
+    app.kubernetes.io/name: openapi
+    app.kubernetes.io/instance: openapi
+    enabler: openapi
+    app.kubernetes.io/component: frontend
+    isMainInterface: "no"
+    tier: internal
+---
+# Source: openapi/templates/konga/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: openapi-konga
+  namespace: "default"
+  labels:
+    helm.sh/chart: openapi-0.1.0
+    app.kubernetes.io/name: openapi
+    app.kubernetes.io/instance: openapi
+    enabler: openapi
+    app.kubernetes.io/component: konga
+    isMainInterface: "yes"
+    tier: external
+    app.kubernetes.io/version: "2.8"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  type: NodePort
+  ports:
+    - port: 1337
+      targetPort: 1337
+      protocol: TCP
+      nodePort: 31337
+      
+  selector:
+    app.kubernetes.io/name: openapi
+    app.kubernetes.io/instance: openapi
+    enabler: openapi
+    app.kubernetes.io/component: konga
+    isMainInterface: "yes"
+    tier: external
+---
+# Source: openapi/templates/service-kong-admin.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: openapi-openapi-admin
+  namespace: default
+  labels:
+    app.kubernetes.io/name: openapi
+    helm.sh/chart: openapi-0.1.0
+    app.kubernetes.io/instance: "openapi"
+    app.kubernetes.io/managed-by: "Helm"
+    app.kubernetes.io/version: "2.8"
+spec:
+  type: NodePort
+  ports:
+  - name: kong-admin
+    port: 8001
+    targetPort: 8001
+    appProtocol: http
+    protocol: TCP
+  selector:
+    app.kubernetes.io/name: openapi
+    app.kubernetes.io/component: kong
+    app.kubernetes.io/instance: "openapi"
+---
+# Source: openapi/templates/service-kong-proxy.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: openapi-openapi-proxy
+  namespace: default
+  labels:
+    app.kubernetes.io/name: openapi
+    helm.sh/chart: openapi-0.1.0
+    app.kubernetes.io/instance: "openapi"
+    app.kubernetes.io/managed-by: "Helm"
+    app.kubernetes.io/version: "2.8"
+    enable-metrics: "true"
+spec:
+  type: LoadBalancer
+  ports:
+  - name: kong-proxy
+    port: 80
+    targetPort: 8000
+    appProtocol: http
+    nodePort: 32744
+    protocol: TCP
+  - name: kong-proxy-tls
+    port: 443
+    targetPort: 8443
+    appProtocol: https
+    protocol: TCP
+  selector:
+    app.kubernetes.io/name: openapi
+    app.kubernetes.io/component: kong
+    app.kubernetes.io/instance: "openapi"
+---
+# Source: openapi/templates/backend/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openapi-backend
+  namespace: "default"
+  labels:
+    helm.sh/chart: openapi-0.1.0
+    app.kubernetes.io/name: openapi
+    app.kubernetes.io/instance: openapi
+    enabler: openapi
+    app.kubernetes.io/component: backend
+    isMainInterface: "no"
+    tier: internal
+    app.kubernetes.io/version: "2.8"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openapi
+      app.kubernetes.io/instance: openapi
+      enabler: openapi
+      app.kubernetes.io/component: backend
+      isMainInterface: "no"
+      tier: internal
+  template:
+    metadata:
+      labels:
+        helm.sh/chart: openapi-0.1.0
+        app.kubernetes.io/name: openapi
+        app.kubernetes.io/instance: openapi
+        enabler: openapi
+        app.kubernetes.io/component: backend
+        isMainInterface: "no"
+        tier: internal
+        app.kubernetes.io/version: "2.8"
+        app.kubernetes.io/managed-by: Helm
+    spec:
+      securityContext:
+        {}
+      containers:
+        - name: backend
+          securityContext:
+            {}
+          image: "gitlab.assist-iot.eu:5050/enablers-registry/public/openapi-backend:1.0.0"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8999
+              protocol: TCP
+          resources:
+            {}
+          env:
+            - name: deckKongAddr
+              value: openapi-openapi-admin:8001
+            - name: keycloakClient
+              value: "private-client"
+            - name: keycloakClientSecret
+              value: "4Nq9MekVKhsrcoP19OUbTTtmK2J8XsnF"
+            - name: keycloakRealm
+              value: "OpenAPI"
+            - name: keycloakUrl
+              value: "http://160.40.50.74:9120/"
+            - name: kongAddr
+              value: openapi-openapi-proxy
+            - name: portalDomain
+              value: openapi-backend:8999
+---
+# Source: openapi/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openapi-openapi
+  namespace:  default
+  labels:
+    app.kubernetes.io/name: openapi
+    helm.sh/chart: openapi-0.1.0
+    app.kubernetes.io/instance: "openapi"
+    app.kubernetes.io/managed-by: "Helm"
+    app.kubernetes.io/version: "2.8"
+    app.kubernetes.io/component: kong
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openapi
+      app.kubernetes.io/component: kong
+      app.kubernetes.io/instance: "openapi"
+
+  template:
+    metadata:
+      annotations:
+        kuma.io/service-account-token-volume: openapi-openapi-token
+        kuma.io/gateway: "enabled"
+        traffic.sidecar.istio.io/includeInboundPorts: ""
+      labels:
+        app.kubernetes.io/name: openapi
+        helm.sh/chart: openapi-0.1.0
+        app.kubernetes.io/instance: "openapi"
+        app.kubernetes.io/managed-by: "Helm"
+        app.kubernetes.io/version: "2.8"
+        app.kubernetes.io/component: kong
+        app: openapi-openapi
+        version: "2.8"
+    spec:
+      serviceAccountName: openapi-openapi
+      automountServiceAccountToken: false
+      initContainers:
+      - name: clear-stale-pid
+        image: gitlab.assist-iot.eu:5050/enablers-registry/public/kong-oidc:1.0.0
+        imagePullPolicy: IfNotPresent
+        securityContext:
+        
+          {}
+        resources:
+          {}
+        command:
+        - "rm"
+        - "-vrf"
+        - "$KONG_PREFIX/pids"
+        env:
+         
+        - name: KONG_ADMIN_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_GUI_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_GUI_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_LISTEN
+          value: "0.0.0.0:8001"
+        - name: KONG_CLUSTER_LISTEN
+          value: "off"
+        - name: KONG_DATABASE
+          value: "postgres"
+        - name: KONG_KIC
+          value: "on"
+        - name: KONG_LUA_PACKAGE_PATH
+          value: "/opt/?.lua;/opt/?/init.lua;;"
+        - name: KONG_NGINX_WORKER_PROCESSES
+          value: "2"
+        - name: KONG_PG_DATABASE
+          value: "kong"
+        - name: KONG_PG_HOST
+          value: "openapi-postgresql"
+        - name: KONG_PG_PASSWORD
+          value: "kong"
+        - name: KONG_PG_PORT
+          value: "5432"
+        - name: KONG_PG_TIMEOUT
+          value: "5000"
+        - name: KONG_PG_USER
+          value: "kong"
+        - name: KONG_PLUGINS
+          value: "bundled,kong-oidc"
+        - name: KONG_PORTAL_API_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PORTAL_API_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_PORT_MAPS
+          value: "80:8000, 443:8443"
+        - name: KONG_PREFIX
+          value: "/kong_prefix/"
+        - name: KONG_PROXY_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PROXY_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_PROXY_LISTEN
+          value: "0.0.0.0:8000, 0.0.0.0:8443 http2 ssl"
+        - name: KONG_STATUS_LISTEN
+          value: "0.0.0.0:8100"
+        - name: KONG_STREAM_LISTEN
+          value: "off"
+        volumeMounts:
+        - name: openapi-openapi-prefix-dir
+          mountPath: /kong_prefix/
+        - name: openapi-openapi-tmp
+          mountPath: /tmp
+        - name:  kong-plugin-kong-oidc
+          mountPath: /opt/kong/plugins/kong-oidc
+          readOnly: true
+      - name: wait-for-db
+        image: gitlab.assist-iot.eu:5050/enablers-registry/public/kong-oidc:1.0.0
+        imagePullPolicy: IfNotPresent
+        securityContext:
+        
+          {}
+        env:
+         
+        - name: KONG_ADMIN_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_GUI_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_GUI_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_LISTEN
+          value: "0.0.0.0:8001"
+        - name: KONG_CLUSTER_LISTEN
+          value: "off"
+        - name: KONG_DATABASE
+          value: "postgres"
+        - name: KONG_KIC
+          value: "on"
+        - name: KONG_LUA_PACKAGE_PATH
+          value: "/opt/?.lua;/opt/?/init.lua;;"
+        - name: KONG_NGINX_WORKER_PROCESSES
+          value: "2"
+        - name: KONG_PG_DATABASE
+          value: "kong"
+        - name: KONG_PG_HOST
+          value: "openapi-postgresql"
+        - name: KONG_PG_PASSWORD
+          value: "kong"
+        - name: KONG_PG_PORT
+          value: "5432"
+        - name: KONG_PG_TIMEOUT
+          value: "5000"
+        - name: KONG_PG_USER
+          value: "kong"
+        - name: KONG_PLUGINS
+          value: "bundled,kong-oidc"
+        - name: KONG_PORTAL_API_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PORTAL_API_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_PORT_MAPS
+          value: "80:8000, 443:8443"
+        - name: KONG_PREFIX
+          value: "/kong_prefix/"
+        - name: KONG_PROXY_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PROXY_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_PROXY_LISTEN
+          value: "0.0.0.0:8000, 0.0.0.0:8443 http2 ssl"
+        - name: KONG_STATUS_LISTEN
+          value: "0.0.0.0:8100"
+        - name: KONG_STREAM_LISTEN
+          value: "off"
+      
+        args: [ "/bin/sh", "-c", "export KONG_NGINX_DAEMON=on KONG_PREFIX=`mktemp -d` KONG_KEYRING_ENABLED=off; until kong start; do echo 'waiting for db'; sleep 1; done; kong stop"]
+        volumeMounts:
+          - name: openapi-openapi-prefix-dir
+            mountPath: /kong_prefix/
+          - name: openapi-openapi-tmp
+            mountPath: /tmp
+          - name:  kong-plugin-kong-oidc
+            mountPath: /opt/kong/plugins/kong-oidc
+            readOnly: true
+          
+        resources:
+          {}
+      containers:
+      - name: ingress-controller
+        securityContext:
+      
+          {}
+        args:
+        
+        ports:
+        - name: cmetrics
+          containerPort: 10255
+          protocol: TCP
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace  
+        
+        
+        - name: CONTROLLER_ELECTION_ID
+          value: "kong-ingress-controller-leader-kong"
+        - name: CONTROLLER_INGRESS_CLASS
+          value: "kong"
+        - name: CONTROLLER_KONG_ADMIN_TLS_SKIP_VERIFY
+          value: "true"
+        - name: CONTROLLER_KONG_ADMIN_URL
+          value: "http://localhost:8001"
+        - name: CONTROLLER_PUBLISH_SERVICE
+          value: "default/openapi-openapi-proxy"
+        image: kong/kubernetes-ingress-controller:2.3
+        imagePullPolicy: IfNotPresent
+      
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /healthz
+            port: 10254
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /healthz
+            port: 10254
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        resources:
+          {}
+        terminationGracePeriodSeconds: 
+        volumeMounts:
+        - name: openapi-openapi-token
+          mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          readOnly: true
+        
+      
+      - name: "proxy"
+        image: gitlab.assist-iot.eu:5050/enablers-registry/public/kong-oidc:1.0.0
+        imagePullPolicy: IfNotPresent
+        securityContext:
+        
+          {}
+        env:
+         
+        - name: KONG_ADMIN_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_GUI_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_GUI_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_LISTEN
+          value: "0.0.0.0:8001"
+        - name: KONG_CLUSTER_LISTEN
+          value: "off"
+        - name: KONG_DATABASE
+          value: "postgres"
+        - name: KONG_KIC
+          value: "on"
+        - name: KONG_LUA_PACKAGE_PATH
+          value: "/opt/?.lua;/opt/?/init.lua;;"
+        - name: KONG_NGINX_WORKER_PROCESSES
+          value: "2"
+        - name: KONG_PG_DATABASE
+          value: "kong"
+        - name: KONG_PG_HOST
+          value: "openapi-postgresql"
+        - name: KONG_PG_PASSWORD
+          value: "kong"
+        - name: KONG_PG_PORT
+          value: "5432"
+        - name: KONG_PG_TIMEOUT
+          value: "5000"
+        - name: KONG_PG_USER
+          value: "kong"
+        - name: KONG_PLUGINS
+          value: "bundled,kong-oidc"
+        - name: KONG_PORTAL_API_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PORTAL_API_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_PORT_MAPS
+          value: "80:8000, 443:8443"
+        - name: KONG_PREFIX
+          value: "/kong_prefix/"
+        - name: KONG_PROXY_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PROXY_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_PROXY_LISTEN
+          value: "0.0.0.0:8000, 0.0.0.0:8443 http2 ssl"
+        - name: KONG_STATUS_LISTEN
+          value: "0.0.0.0:8100"
+        - name: KONG_STREAM_LISTEN
+          value: "off"
+        - name: KONG_NGINX_DAEMON
+          value: "off"
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - kong
+              - quit
+              - --wait=15
+        ports:
+        - name: admin
+          containerPort: 8001
+          protocol: TCP
+        - name: proxy
+          containerPort: 8000
+          protocol: TCP
+        - name: proxy-tls
+          containerPort: 8443
+          protocol: TCP
+        - name: status
+          containerPort: 8100
+          protocol: TCP
+        volumeMounts:
+          - name: openapi-openapi-prefix-dir
+            mountPath: /kong_prefix/
+          - name: openapi-openapi-tmp
+            mountPath: /tmp
+          - name:  kong-plugin-kong-oidc
+            mountPath: /opt/kong/plugins/kong-oidc
+            readOnly: true
+          
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /status
+            port: status
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /status
+            port: status
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        resources:
+          {} 
+      securityContext:
+        {}
+      terminationGracePeriodSeconds: 30
+      tolerations:
+        []
+      volumes:
+        - name: openapi-openapi-prefix-dir
+          emptyDir: {}
+        - name: openapi-openapi-tmp
+          emptyDir: {}
+        - name: openapi-openapi-bash-wait-for-postgres
+          configMap:
+            name: openapi-openapi-bash-wait-for-postgres
+            defaultMode: 0755
+        - name: kong-plugin-kong-oidc
+          configMap:
+            name: kong-oidc-plugin
+        
+        - name: openapi-openapi-token
+          secret:
+            secretName: openapi-openapi-token
+            items:
+            - key: token
+              path: token
+            - key: ca.crt
+              path: ca.crt
+            - key: namespace
+              path: namespace
+---
+# Source: openapi/templates/frontend/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openapi-frontend
+  namespace: "default"
+  labels:
+    helm.sh/chart: openapi-0.1.0
+    app.kubernetes.io/name: openapi
+    app.kubernetes.io/instance: openapi
+    enabler: openapi
+    app.kubernetes.io/component: frontend
+    isMainInterface: "no"
+    tier: internal
+    app.kubernetes.io/version: "2.8"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openapi
+      app.kubernetes.io/instance: openapi
+      enabler: openapi
+      app.kubernetes.io/component: frontend
+      isMainInterface: "no"
+      tier: internal
+  template:
+    metadata:
+      labels:
+        helm.sh/chart: openapi-0.1.0
+        app.kubernetes.io/name: openapi
+        app.kubernetes.io/instance: openapi
+        enabler: openapi
+        app.kubernetes.io/component: frontend
+        isMainInterface: "no"
+        tier: internal
+        app.kubernetes.io/version: "2.8"
+        app.kubernetes.io/managed-by: Helm
+    spec:
+      securityContext:
+        {}
+      containers:
+        - name: frontend
+          securityContext:
+            {}
+          image: "gitlab.assist-iot.eu:5050/enablers-registry/public/openapi-frontend:1.0.0"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+              protocol: TCP
+          resources:
+            {}
+          env:
+            - name: reactAppBaseUrl
+              value: openapi-backend:8999
+          volumeMounts:   
+            - name: frontendconfig-volume
+              mountPath: /app/public/keycloak.json
+              subPath: keycloak.json
+      volumes:
+        - name: frontendconfig-volume
+          configMap:
+            name: frontendconfig
+---
+# Source: openapi/templates/konga/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openapi-konga
+  namespace: "default"
+  labels:
+    helm.sh/chart: openapi-0.1.0
+    app.kubernetes.io/name: openapi
+    app.kubernetes.io/instance: openapi
+    enabler: openapi
+    app.kubernetes.io/component: konga
+    isMainInterface: "yes"
+    tier: external
+    app.kubernetes.io/version: "2.8"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openapi
+      app.kubernetes.io/instance: openapi
+      enabler: openapi
+      app.kubernetes.io/component: konga
+      isMainInterface: "yes"
+      tier: external
+  template:
+    metadata:
+      labels:
+        helm.sh/chart: openapi-0.1.0
+        app.kubernetes.io/name: openapi
+        app.kubernetes.io/instance: openapi
+        enabler: openapi
+        app.kubernetes.io/component: konga
+        isMainInterface: "yes"
+        tier: external
+        app.kubernetes.io/version: "2.8"
+        app.kubernetes.io/managed-by: Helm
+    spec:
+      securityContext:
+        {}
+      containers:
+        - name: konga
+          securityContext:
+            {}
+          image: "pantsel/konga:latest"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 1337
+              protocol: TCP
+          resources:
+            {}
+          env:
+            - name: NODE_ENV
+              value: "production"
+---
+# Source: openapi/charts/postgresql/templates/primary/statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: openapi-postgresql
+  namespace: default
+  labels:
+    app.kubernetes.io/name: postgresql
+    helm.sh/chart: postgresql-11.1.15
+    app.kubernetes.io/instance: openapi
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: primary
+  annotations:
+spec:
+  replicas: 1
+  serviceName: openapi-postgresql-hl
+  updateStrategy:
+    rollingUpdate: {}
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgresql
+      app.kubernetes.io/instance: openapi
+      app.kubernetes.io/component: primary
+  template:
+    metadata:
+      name: openapi-postgresql
+      labels:
+        app.kubernetes.io/name: postgresql
+        helm.sh/chart: postgresql-11.1.15
+        app.kubernetes.io/instance: openapi
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: primary
+      annotations:
+    spec:
+      serviceAccountName: default
+      
+      affinity:
+        podAffinity:
+          
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: postgresql
+                    app.kubernetes.io/instance: openapi
+                    app.kubernetes.io/component: primary
+                namespaces:
+                  - "default"
+                topologyKey: kubernetes.io/hostname
+              weight: 1
+        nodeAffinity:
+          
+      securityContext:
+        fsGroup: 1001
+      hostNetwork: false
+      hostIPC: false
+      initContainers:
+      containers:
+        - name: postgresql
+          image: docker.io/bitnami/postgresql:13.6.0-debian-10-r52
+          imagePullPolicy: "IfNotPresent"
+          securityContext:
+            runAsUser: 1001
+          env:
+            - name: BITNAMI_DEBUG
+              value: "false"
+            - name: POSTGRESQL_PORT_NUMBER
+              value: "5432"
+            - name: POSTGRESQL_VOLUME_DIR
+              value: "/bitnami/postgresql"
+            - name: PGDATA
+              value: "/bitnami/postgresql/data"
+            # Authentication
+            - name: POSTGRES_USER
+              value: "kong"
+            - name: POSTGRES_POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: openapi-postgresql
+                  key: postgres-password
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: openapi-postgresql
+                  key: password
+            - name: POSTGRES_DB
+              value: "kong"
+            # Replication
+            # Initdb
+            # Standby
+            # LDAP
+            - name: POSTGRESQL_ENABLE_LDAP
+              value: "no"
+            # TLS
+            - name: POSTGRESQL_ENABLE_TLS
+              value: "no"
+            # Audit
+            - name: POSTGRESQL_LOG_HOSTNAME
+              value: "false"
+            - name: POSTGRESQL_LOG_CONNECTIONS
+              value: "false"
+            - name: POSTGRESQL_LOG_DISCONNECTIONS
+              value: "false"
+            - name: POSTGRESQL_PGAUDIT_LOG_CATALOG
+              value: "off"
+            # Others
+            - name: POSTGRESQL_CLIENT_MIN_MESSAGES
+              value: "error"
+            - name: POSTGRESQL_SHARED_PRELOAD_LIBRARIES
+              value: "pgaudit"
+          ports:
+            - name: tcp-postgresql
+              containerPort: 5432
+          livenessProbe:
+            failureThreshold: 6
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 5
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - exec pg_isready -U "kong" -d "dbname=kong" -h 127.0.0.1 -p 5432
+          readinessProbe:
+            failureThreshold: 6
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 5
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - -e
+                
+                - |
+                  exec pg_isready -U "kong" -d "dbname=kong" -h 127.0.0.1 -p 5432
+                  [ -f /opt/bitnami/postgresql/tmp/.initialized ] || [ -f /bitnami/postgresql/.initialized ]
+          resources:
+            limits: {}
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: data
+              mountPath: /bitnami/postgresql
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - "ReadWriteOnce"
+        resources:
+          requests:
+            storage: "8Gi"
+---
+# Source: openapi/templates/migrations.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: openapi-openapi-init-migrations
+  namespace: default
+  labels:
+    app.kubernetes.io/name: openapi
+    helm.sh/chart: openapi-0.1.0
+    app.kubernetes.io/instance: "openapi"
+    app.kubernetes.io/managed-by: "Helm"
+    app.kubernetes.io/version: "2.8"
+    app.kubernetes.io/component: init-migrations
+  annotations:
+spec:
+  backoffLimit: 
+  template:
+    metadata:
+      name: openapi-init-migrations
+      labels:
+        app.kubernetes.io/name: openapi
+        helm.sh/chart: openapi-0.1.0
+        app.kubernetes.io/instance: "openapi"
+        app.kubernetes.io/managed-by: "Helm"
+        app.kubernetes.io/version: "2.8"
+        app.kubernetes.io/component: init-migrations
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      serviceAccountName: openapi-openapi
+      automountServiceAccountToken: true
+      initContainers:
+      - name: wait-for-postgres 
+        image: gitlab.assist-iot.eu:5050/enablers-registry/public/kong-oidc:1.0.0
+        imagePullPolicy: IfNotPresent
+        env:
+         
+        - name: KONG_ADMIN_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_GUI_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_GUI_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_LISTEN
+          value: "0.0.0.0:8001"
+        - name: KONG_CLUSTER_LISTEN
+          value: "off"
+        - name: KONG_DATABASE
+          value: "postgres"
+        - name: KONG_KIC
+          value: "on"
+        - name: KONG_LUA_PACKAGE_PATH
+          value: "/opt/?.lua;/opt/?/init.lua;;"
+        - name: KONG_NGINX_WORKER_PROCESSES
+          value: "2"
+        - name: KONG_PG_DATABASE
+          value: "kong"
+        - name: KONG_PG_HOST
+          value: "openapi-postgresql"
+        - name: KONG_PG_PASSWORD
+          value: "kong"
+        - name: KONG_PG_PORT
+          value: "5432"
+        - name: KONG_PG_TIMEOUT
+          value: "5000"
+        - name: KONG_PG_USER
+          value: "kong"
+        - name: KONG_PLUGINS
+          value: "bundled,kong-oidc"
+        - name: KONG_PORTAL_API_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PORTAL_API_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_PORT_MAPS
+          value: "80:8000, 443:8443"
+        - name: KONG_PREFIX
+          value: "/kong_prefix/"
+        - name: KONG_PROXY_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PROXY_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_PROXY_LISTEN
+          value: "0.0.0.0:8000, 0.0.0.0:8443 http2 ssl"
+        - name: KONG_STATUS_LISTEN
+          value: "0.0.0.0:8100"
+        - name: KONG_STREAM_LISTEN
+          value: "off"
+        - name: KONG_NGINX_DAEMON
+          value: "off"
+        command: [ "bash", "/wait_postgres/wait.sh" ]
+        volumeMounts:
+        - name: openapi-openapi-bash-wait-for-postgres
+          mountPath: /wait_postgres
+        resources:
+          {}
+      containers:
+      - name: openapi-migrations
+        image: gitlab.assist-iot.eu:5050/enablers-registry/public/kong-oidc:1.0.0
+        imagePullPolicy: IfNotPresent
+        securityContext:
+        
+          {} 
+        env:
+         
+        - name: KONG_ADMIN_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_GUI_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_GUI_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_LISTEN
+          value: "0.0.0.0:8001"
+        - name: KONG_CLUSTER_LISTEN
+          value: "off"
+        - name: KONG_DATABASE
+          value: "postgres"
+        - name: KONG_KIC
+          value: "on"
+        - name: KONG_LUA_PACKAGE_PATH
+          value: "/opt/?.lua;/opt/?/init.lua;;"
+        - name: KONG_NGINX_WORKER_PROCESSES
+          value: "2"
+        - name: KONG_PG_DATABASE
+          value: "kong"
+        - name: KONG_PG_HOST
+          value: "openapi-postgresql"
+        - name: KONG_PG_PASSWORD
+          value: "kong"
+        - name: KONG_PG_PORT
+          value: "5432"
+        - name: KONG_PG_TIMEOUT
+          value: "5000"
+        - name: KONG_PG_USER
+          value: "kong"
+        - name: KONG_PLUGINS
+          value: "bundled,kong-oidc"
+        - name: KONG_PORTAL_API_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PORTAL_API_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_PORT_MAPS
+          value: "80:8000, 443:8443"
+        - name: KONG_PREFIX
+          value: "/kong_prefix/"
+        - name: KONG_PROXY_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PROXY_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_PROXY_LISTEN
+          value: "0.0.0.0:8000, 0.0.0.0:8443 http2 ssl"
+        - name: KONG_STATUS_LISTEN
+          value: "0.0.0.0:8100"
+        - name: KONG_STREAM_LISTEN
+          value: "off"
+        - name: KONG_NGINX_DAEMON
+          value: "off"
+        args: [ "kong", "migrations", "bootstrap" ]
+        volumeMounts:
+        - name: openapi-openapi-prefix-dir
+          mountPath: /kong_prefix/
+        - name: openapi-openapi-tmp
+          mountPath: /tmp
+        - name:  kong-plugin-kong-oidc
+          mountPath: /opt/kong/plugins/kong-oidc
+          readOnly: true
+        
+        resources:
+          {}
+      securityContext:
+        {}
+      restartPolicy: OnFailure
+      volumes:
+      - name: openapi-openapi-prefix-dir
+        emptyDir: {}
+      - name: openapi-openapi-tmp
+        emptyDir: {}
+      - name: openapi-openapi-bash-wait-for-postgres
+        configMap:
+          name: openapi-openapi-bash-wait-for-postgres
+          defaultMode: 0755
+      - name: kong-plugin-kong-oidc
+        configMap:
+          name: kong-oidc-plugin
+---
+# Source: openapi/templates/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kongatrial
+  annotations:
+    konghq.com/strip-path: "true"
+    # konghq.com/rewrite-target: /konga/register
+spec:
+  ingressClassName: kong
+  rules:
+  - host:
+    http:
+      paths:
+      - path: /
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: openapi-konga
+            port:
+              number: 1337
+      - path: /konga
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: openapi-konga
+            port:
+              number: 1337
+---
+# Source: openapi/templates/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: frontend
+  annotations:
+    konghq.com/strip-path: 'true'
+spec:
+  ingressClassName: kong
+  rules:
+  - host: 
+    http:
+      paths:
+      - path: /frontend
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: openapi-frontend
+            port:
+              number: 3000
+---
+# Source: openapi/templates/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: backend
+  annotations:
+    konghq.com/strip-path: 'true'
+spec:
+  ingressClassName: kong
+  rules:
+  - host: 
+    http:
+      paths:
+      - path: /backend
+        pathType: Prefix
+        backend:
+          service:
+            name: openapi-backend
+            port:
+              number: 8999
+---
+# Source: openapi/templates/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: keycloak
+  annotations:
+    konghq.com/strip-path: 'true'
+spec:
+  ingressClassName: kong
+  rules:
+  - host: 
+    http:
+      paths:
+      - path: /keycloak
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: s21-idm-keycloak
+            port:
+              number: 8080
+---
+# Source: openapi/templates/migrations-post-upgrade.yaml
+# Why is this Job duplicated and not using only helm hooks?
+# See: https://github.com/helm/charts/pull/7362
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: openapi-openapi-post-upgrade-migrations
+  namespace: default
+  labels:
+    app.kubernetes.io/name: openapi
+    helm.sh/chart: openapi-0.1.0
+    app.kubernetes.io/instance: "openapi"
+    app.kubernetes.io/managed-by: "Helm"
+    app.kubernetes.io/version: "2.8"
+    app.kubernetes.io/component: post-upgrade-migrations
+  annotations:
+    helm.sh/hook: "post-upgrade"
+    helm.sh/hook-delete-policy: "before-hook-creation"
+spec:
+  backoffLimit: 
+  template:
+    metadata:
+      name: openapi-post-upgrade-migrations
+      labels:
+        app.kubernetes.io/name: openapi
+        helm.sh/chart: openapi-0.1.0
+        app.kubernetes.io/instance: "openapi"
+        app.kubernetes.io/managed-by: "Helm"
+        app.kubernetes.io/version: "2.8"
+        app.kubernetes.io/component: post-upgrade-migrations
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      serviceAccountName: openapi-openapi
+      automountServiceAccountToken: true
+      initContainers:
+      - name: wait-for-postgres 
+        image: gitlab.assist-iot.eu:5050/enablers-registry/public/kong-oidc:1.0.0
+        imagePullPolicy: IfNotPresent
+        env:
+         
+        - name: KONG_ADMIN_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_GUI_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_GUI_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_LISTEN
+          value: "0.0.0.0:8001"
+        - name: KONG_CLUSTER_LISTEN
+          value: "off"
+        - name: KONG_DATABASE
+          value: "postgres"
+        - name: KONG_KIC
+          value: "on"
+        - name: KONG_LUA_PACKAGE_PATH
+          value: "/opt/?.lua;/opt/?/init.lua;;"
+        - name: KONG_NGINX_WORKER_PROCESSES
+          value: "2"
+        - name: KONG_PG_DATABASE
+          value: "kong"
+        - name: KONG_PG_HOST
+          value: "openapi-postgresql"
+        - name: KONG_PG_PASSWORD
+          value: "kong"
+        - name: KONG_PG_PORT
+          value: "5432"
+        - name: KONG_PG_TIMEOUT
+          value: "5000"
+        - name: KONG_PG_USER
+          value: "kong"
+        - name: KONG_PLUGINS
+          value: "bundled,kong-oidc"
+        - name: KONG_PORTAL_API_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PORTAL_API_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_PORT_MAPS
+          value: "80:8000, 443:8443"
+        - name: KONG_PREFIX
+          value: "/kong_prefix/"
+        - name: KONG_PROXY_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PROXY_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_PROXY_LISTEN
+          value: "0.0.0.0:8000, 0.0.0.0:8443 http2 ssl"
+        - name: KONG_STATUS_LISTEN
+          value: "0.0.0.0:8100"
+        - name: KONG_STREAM_LISTEN
+          value: "off"
+        - name: KONG_NGINX_DAEMON
+          value: "off"
+        command: [ "bash", "/wait_postgres/wait.sh" ]
+        volumeMounts:
+        - name: openapi-openapi-bash-wait-for-postgres
+          mountPath: /wait_postgres
+        resources:
+          {}
+      containers:
+      - name: openapi-post-upgrade-migrations
+        image: gitlab.assist-iot.eu:5050/enablers-registry/public/kong-oidc:1.0.0
+        imagePullPolicy: IfNotPresent
+        securityContext:
+        
+          {} 
+        env:
+         
+        - name: KONG_ADMIN_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_GUI_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_GUI_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_LISTEN
+          value: "0.0.0.0:8001"
+        - name: KONG_CLUSTER_LISTEN
+          value: "off"
+        - name: KONG_DATABASE
+          value: "postgres"
+        - name: KONG_KIC
+          value: "on"
+        - name: KONG_LUA_PACKAGE_PATH
+          value: "/opt/?.lua;/opt/?/init.lua;;"
+        - name: KONG_NGINX_WORKER_PROCESSES
+          value: "2"
+        - name: KONG_PG_DATABASE
+          value: "kong"
+        - name: KONG_PG_HOST
+          value: "openapi-postgresql"
+        - name: KONG_PG_PASSWORD
+          value: "kong"
+        - name: KONG_PG_PORT
+          value: "5432"
+        - name: KONG_PG_TIMEOUT
+          value: "5000"
+        - name: KONG_PG_USER
+          value: "kong"
+        - name: KONG_PLUGINS
+          value: "bundled,kong-oidc"
+        - name: KONG_PORTAL_API_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PORTAL_API_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_PORT_MAPS
+          value: "80:8000, 443:8443"
+        - name: KONG_PREFIX
+          value: "/kong_prefix/"
+        - name: KONG_PROXY_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PROXY_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_PROXY_LISTEN
+          value: "0.0.0.0:8000, 0.0.0.0:8443 http2 ssl"
+        - name: KONG_STATUS_LISTEN
+          value: "0.0.0.0:8100"
+        - name: KONG_STREAM_LISTEN
+          value: "off"
+        - name: KONG_NGINX_DAEMON
+          value: "off"
+        args: [ "kong", "migrations", "finish" ]
+        volumeMounts:
+        - name: openapi-openapi-prefix-dir
+          mountPath: /kong_prefix/
+        - name: openapi-openapi-tmp
+          mountPath: /tmp
+        - name:  kong-plugin-kong-oidc
+          mountPath: /opt/kong/plugins/kong-oidc
+          readOnly: true
+        
+        resources:
+          {}
+      securityContext:
+        {}
+      restartPolicy: OnFailure
+      volumes:
+      - name: openapi-openapi-prefix-dir
+        emptyDir: {}
+      - name: openapi-openapi-tmp
+        emptyDir: {}
+      - name: openapi-openapi-bash-wait-for-postgres
+        configMap:
+          name: openapi-openapi-bash-wait-for-postgres
+          defaultMode: 0755
+      - name: kong-plugin-kong-oidc
+        configMap:
+          name: kong-oidc-plugin
+---
+# Source: openapi/templates/migrations-pre-upgrade.yaml
+# Why is this Job duplicated and not using only helm hooks?
+# See: https://github.com/helm/charts/pull/7362
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: openapi-openapi-pre-upgrade-migrations
+  namespace: default
+  labels:
+    app.kubernetes.io/name: openapi
+    helm.sh/chart: openapi-0.1.0
+    app.kubernetes.io/instance: "openapi"
+    app.kubernetes.io/managed-by: "Helm"
+    app.kubernetes.io/version: "2.8"
+    app.kubernetes.io/component: pre-upgrade-migrations
+  annotations:
+    helm.sh/hook: "pre-upgrade"
+    helm.sh/hook-delete-policy: "before-hook-creation"
+spec:
+  backoffLimit: 
+  template:
+    metadata:
+      name: openapi-pre-upgrade-migrations
+      labels:
+        app.kubernetes.io/name: openapi
+        helm.sh/chart: openapi-0.1.0
+        app.kubernetes.io/instance: "openapi"
+        app.kubernetes.io/managed-by: "Helm"
+        app.kubernetes.io/version: "2.8"
+        app.kubernetes.io/component: pre-upgrade-migrations
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      serviceAccountName: openapi-openapi
+      automountServiceAccountToken: true
+      initContainers:
+      - name: wait-for-postgres 
+        image: gitlab.assist-iot.eu:5050/enablers-registry/public/kong-oidc:1.0.0
+        imagePullPolicy: IfNotPresent
+        env:
+         
+        - name: KONG_ADMIN_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_GUI_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_GUI_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_LISTEN
+          value: "0.0.0.0:8001"
+        - name: KONG_CLUSTER_LISTEN
+          value: "off"
+        - name: KONG_DATABASE
+          value: "postgres"
+        - name: KONG_KIC
+          value: "on"
+        - name: KONG_LUA_PACKAGE_PATH
+          value: "/opt/?.lua;/opt/?/init.lua;;"
+        - name: KONG_NGINX_WORKER_PROCESSES
+          value: "2"
+        - name: KONG_PG_DATABASE
+          value: "kong"
+        - name: KONG_PG_HOST
+          value: "openapi-postgresql"
+        - name: KONG_PG_PASSWORD
+          value: "kong"
+        - name: KONG_PG_PORT
+          value: "5432"
+        - name: KONG_PG_TIMEOUT
+          value: "5000"
+        - name: KONG_PG_USER
+          value: "kong"
+        - name: KONG_PLUGINS
+          value: "bundled,kong-oidc"
+        - name: KONG_PORTAL_API_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PORTAL_API_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_PORT_MAPS
+          value: "80:8000, 443:8443"
+        - name: KONG_PREFIX
+          value: "/kong_prefix/"
+        - name: KONG_PROXY_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PROXY_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_PROXY_LISTEN
+          value: "0.0.0.0:8000, 0.0.0.0:8443 http2 ssl"
+        - name: KONG_STATUS_LISTEN
+          value: "0.0.0.0:8100"
+        - name: KONG_STREAM_LISTEN
+          value: "off"
+        - name: KONG_NGINX_DAEMON
+          value: "off"
+        command: [ "bash", "/wait_postgres/wait.sh" ]
+        volumeMounts:
+        - name: openapi-openapi-bash-wait-for-postgres
+          mountPath: /wait_postgres
+        resources:
+          {}
+      containers:
+      - name: openapi-upgrade-migrations
+        image: gitlab.assist-iot.eu:5050/enablers-registry/public/kong-oidc:1.0.0
+        imagePullPolicy: IfNotPresent
+        securityContext:
+        
+          {} 
+        env:
+         
+        - name: KONG_ADMIN_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_GUI_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_GUI_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_LISTEN
+          value: "0.0.0.0:8001"
+        - name: KONG_CLUSTER_LISTEN
+          value: "off"
+        - name: KONG_DATABASE
+          value: "postgres"
+        - name: KONG_KIC
+          value: "on"
+        - name: KONG_LUA_PACKAGE_PATH
+          value: "/opt/?.lua;/opt/?/init.lua;;"
+        - name: KONG_NGINX_WORKER_PROCESSES
+          value: "2"
+        - name: KONG_PG_DATABASE
+          value: "kong"
+        - name: KONG_PG_HOST
+          value: "openapi-postgresql"
+        - name: KONG_PG_PASSWORD
+          value: "kong"
+        - name: KONG_PG_PORT
+          value: "5432"
+        - name: KONG_PG_TIMEOUT
+          value: "5000"
+        - name: KONG_PG_USER
+          value: "kong"
+        - name: KONG_PLUGINS
+          value: "bundled,kong-oidc"
+        - name: KONG_PORTAL_API_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PORTAL_API_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_PORT_MAPS
+          value: "80:8000, 443:8443"
+        - name: KONG_PREFIX
+          value: "/kong_prefix/"
+        - name: KONG_PROXY_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PROXY_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_PROXY_LISTEN
+          value: "0.0.0.0:8000, 0.0.0.0:8443 http2 ssl"
+        - name: KONG_STATUS_LISTEN
+          value: "0.0.0.0:8100"
+        - name: KONG_STREAM_LISTEN
+          value: "off"
+        - name: KONG_NGINX_DAEMON
+          value: "off"
+        args: [ "kong", "migrations", "up" ]
+        volumeMounts:
+        - name: openapi-openapi-prefix-dir
+          mountPath: /kong_prefix/
+        - name: openapi-openapi-tmp
+          mountPath: /tmp
+        - name:  kong-plugin-kong-oidc
+          mountPath: /opt/kong/plugins/kong-oidc
+          readOnly: true
+        
+        resources:
+          {}
+      securityContext:
+        {}
+      restartPolicy: OnFailure
+      volumes:
+      - name: openapi-openapi-prefix-dir
+        emptyDir: {}
+      - name: openapi-openapi-tmp
+        emptyDir: {}
+      - name: openapi-openapi-bash-wait-for-postgres
+        configMap:
+          name: openapi-openapi-bash-wait-for-postgres
+          defaultMode: 0755
+      - name: kong-plugin-kong-oidc
+        configMap:
+          name: kong-oidc-plugin
