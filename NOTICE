@@ -1,0 +1,29 @@
+ASSIST-IoT - Architecture for Scalable, Self-*, human-centric, Intelligent, Secure, and Tactile next generation IoT
+
+This project has received funding from the European Union's Horizon 2020 research and innovation programme under grant agreement No 957258.
+
+OpenAPI Management Enabler
+
+Copyright 2020-2023 Centre for Research and Tehnology Hellas / Information Technologies Institute
+
+I. Included Software
+
+- Kong API Gateway (https://github.com/Kong/kong) Apache 2.0 License 
+- Konga GUI (https://github.com/pantsel/konga) MIT License (MIT)
+- Python (https://www.python.org/) 
+- JavaScript (https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Introduction) 
+- OpenAPI Specification (https://github.com/OAI/OpenAPI-Specification) Apache 2.0 License
+- Swagger UI (https://github.com/swagger-api/swagger-ui) Apache 2.0 License
+
+II. Used Software
+
+- Python FastAPI (https://github.com/tiangolo/fastapi), MIT license
+- React JS (https://github.com/facebook/react/), MIT license
+- swagger-ui-react (https://www.npmjs.com/package/swagger-ui-react?activeTab=code), Apache-2.0 license
+
+
+III. List of licenses
+
+- BSD-3-Clause license (https://opensource.org/license/bsd-3-clause/)
+- Apache-2.0 license (https://www.apache.org/licenses/LICENSE-2.0)
+- MIT license (https://opensource.org/license/mit/)
